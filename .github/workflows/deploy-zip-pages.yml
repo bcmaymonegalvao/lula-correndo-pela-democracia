@@ -1,0 +1,381 @@
+name: Publicar jogo ZIP no GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - site.zip
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validar e extrair o jogo
+        shell: bash
+        run: |
+          python3 - site.zip _site <<'PYTHON'
+          #!/usr/bin/env python3
+          """Prepare a static website ZIP for GitHub Pages."""
+
+          from __future__ import annotations
+
+          import shutil
+          import stat
+          import sys
+          import zipfile
+
+          from html.parser import HTMLParser
+          from pathlib import Path, PurePosixPath
+          from urllib.parse import urlsplit, unquote
+
+          MAX_FILES = 2500
+          MAX_UNCOMPRESSED = 200 * 1024 * 1024
+          MAX_SINGLE_FILE = 50 * 1024 * 1024
+
+          ALLOWED_ROOT_FILES = {
+              "index.html",
+              "animacoes.html",
+              "404.html",
+              ".nojekyll",
+              "manifest.json",
+              "manifest.webmanifest",
+              "favicon.ico",
+              "robots.txt",
+              "VERSAO.txt",
+          }
+
+          ALLOWED_FOLDERS = {
+              "assets",
+              "css",
+              "js",
+              "audio",
+              "sounds",
+              "fonts",
+              "images",
+              "data",
+          }
+
+          def clean_name(filename: str) -> PurePosixPath:
+              if "\\" in filename or "\x00" in filename:
+                  raise ValueError(
+                      f"Nome de arquivo inválido no ZIP: {filename!r}"
+                  )
+
+              if filename.startswith("/"):
+                  raise ValueError(
+                      f"Caminho absoluto proibido: {filename}"
+                  )
+
+              path = PurePosixPath(filename)
+
+              if not path.parts or any(
+                  part in {".", ".."} for part in path.parts
+              ):
+                  raise ValueError(
+                      f"Caminho inseguro no ZIP: {filename}"
+                  )
+
+              if ":" in path.parts[0]:
+                  raise ValueError(
+                      f"Caminho de unidade inválido: {filename}"
+                  )
+
+              return path
+
+          class LocalLinks(HTMLParser):
+
+              def __init__(self) -> None:
+                  super().__init__()
+                  self.urls: list[str] = []
+
+              def handle_starttag(
+                  self,
+                  tag: str,
+                  attrs: list[tuple[str, str | None]]
+              ) -> None:
+
+                  values = dict(attrs)
+
+                  url = (
+                      values.get("src")
+                      if tag == "script"
+                      else values.get("href")
+                      if tag == "link"
+                      else None
+                  )
+
+                  if url:
+                      self.urls.append(url)
+
+          def check_html_links(site: Path) -> None:
+
+              for html in [
+                  site / "index.html",
+                  site / "animacoes.html"
+              ]:
+
+                  if not html.exists():
+                      continue
+
+                  parser = LocalLinks()
+
+                  parser.feed(
+                      html.read_text(encoding="utf-8")
+                  )
+
+                  for url in parser.urls:
+
+                      parts = urlsplit(url)
+
+                      if (
+                          parts.scheme
+                          or parts.netloc
+                          or url.startswith(("#", "//"))
+                      ):
+                          continue
+
+                      relative = unquote(
+                          parts.path
+                      ).lstrip("/")
+
+                      if not relative:
+                          continue
+
+                      dest = (
+                          html.parent / relative
+                      ).resolve()
+
+                      if (
+                          not dest.is_relative_to(site.resolve())
+                          or not dest.is_file()
+                      ):
+                          raise ValueError(
+                              "Recurso de HTML inexistente "
+                              f"ou fora do site: {html.name} -> {url}"
+                          )
+
+          def prepare(
+              zip_path: Path,
+              dest: Path
+          ) -> tuple[int, int]:
+
+              if not zip_path.is_file():
+                  raise FileNotFoundError(
+                      f"Arquivo {zip_path} não encontrado. "
+                      "Envie o ZIP do jogo com o nome "
+                      "exato site.zip para a raiz "
+                      "do repositório."
+                  )
+
+              if not zipfile.is_zipfile(zip_path):
+                  raise ValueError(
+                      "site.zip não é um arquivo ZIP válido"
+                  )
+
+              with zipfile.ZipFile(zip_path) as archive:
+
+                  files: list[
+                      tuple[zipfile.ZipInfo, PurePosixPath]
+                  ] = []
+
+                  total_size = 0
+
+                  for info in archive.infolist():
+
+                      path = clean_name(info.filename)
+
+                      if info.is_dir():
+                          continue
+
+                      mode = info.external_attr >> 16
+
+                      if stat.S_ISLNK(mode):
+                          raise ValueError(
+                              "Links simbólicos não são "
+                              f"permitidos: {info.filename}"
+                          )
+
+                      if info.file_size > MAX_SINGLE_FILE:
+                          raise ValueError(
+                              f"Arquivo muito grande: {info.filename}"
+                          )
+
+                      total_size += info.file_size
+
+                      if (
+                          total_size > MAX_UNCOMPRESSED
+                          or len(files) >= MAX_FILES
+                      ):
+                          raise ValueError(
+                              "O ZIP excede os limites de "
+                              "segurança (200 MB ou 2500 arquivos)"
+                          )
+
+                      files.append((info, path))
+
+                  possible_roots = [
+                      path.parent
+                      for _, path in files
+                      if path.name == "index.html"
+                  ]
+
+                  roots = set(possible_roots)
+
+                  if len(roots) != 1:
+                      raise ValueError(
+                          "O ZIP deve conter exatamente um "
+                          "index.html na raiz ou em uma "
+                          "pasta principal"
+                      )
+
+                  root = next(iter(roots))
+
+                  if len(root.parts) > 1:
+                      raise ValueError(
+                          "O index.html precisa estar na raiz "
+                          "ou em uma única pasta envoltória"
+                      )
+
+                  if dest.exists():
+                      shutil.rmtree(dest)
+
+                  dest.mkdir(parents=True)
+
+                  written: set[str] = set()
+                  extracted = 0
+
+                  for info, path in files:
+
+                      if root != PurePosixPath("."):
+
+                          try:
+                              path = path.relative_to(root)
+
+                          except ValueError:
+                              continue
+
+                      if (
+                          path.name.startswith(".")
+                          and path.name != ".nojekyll"
+                      ):
+                          continue
+
+                      if (
+                          path.parts[0] not in ALLOWED_FOLDERS
+                          and str(path) not in ALLOWED_ROOT_FILES
+                      ):
+                          continue
+
+                      if any(
+                          part.startswith(".")
+                          for part in path.parts[:-1]
+                      ):
+                          continue
+
+                      rel = str(path)
+
+                      if rel in written:
+                          raise ValueError(
+                              f"Arquivo duplicado no ZIP: {rel}"
+                          )
+
+                      written.add(rel)
+
+                      target = dest.joinpath(*path.parts)
+
+                      target.parent.mkdir(
+                          parents=True,
+                          exist_ok=True
+                      )
+
+                      with (
+                          archive.open(info) as src,
+                          target.open("wb") as dst
+                      ):
+                          shutil.copyfileobj(src, dst)
+
+                      extracted += 1
+
+              if not (dest / "index.html").is_file():
+                  raise ValueError(
+                      "O pacote não produziu o index.html do jogo"
+                  )
+
+              (dest / ".nojekyll").touch(exist_ok=True)
+
+              check_html_links(dest)
+
+              return extracted, total_size
+
+          if __name__ == "__main__":
+
+              if len(sys.argv) != 3:
+                  sys.exit(
+                      "Uso: prepare_site.py "
+                      "<arquivo.zip> <pasta_saida>"
+                  )
+
+              try:
+
+                  count, original_size = prepare(
+                      Path(sys.argv[1]),
+                      Path(sys.argv[2])
+                  )
+
+                  print(
+                      f"Site válido: {count} arquivos "
+                      "prontos para publicação; "
+                      f"{original_size / 1024 / 1024:.1f} MiB "
+                      "no ZIP descompactado."
+                  )
+
+              except (
+                  ValueError,
+                  FileNotFoundError,
+                  zipfile.BadZipFile,
+                  UnicodeError
+              ) as exc:
+
+                  sys.exit(
+                      f"ERRO NA PUBLICAÇÃO: {exc}"
+                  )
+          PYTHON
+
+      - name: Verificar sintaxe JavaScript
+        run: |
+          if [ -d _site/js ]; then
+            find _site/js -type f -name '*.js' -print0 | xargs -0 -r -n1 node --check
+          fi
+
+      - name: Configurar Pages
+        uses: actions/configure-pages@v5
+
+      - name: Empacotar site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: Publicar site
+        id: deployment
+        uses: actions/deploy-pages@v4
