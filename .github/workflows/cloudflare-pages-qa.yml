@@ -1,4 +1,4 @@
-
+  
 name: Cloudflare Pages - QA
 
 on:
@@ -62,8 +62,16 @@ jobs:
 
               for item in itens:
                   nome = item.filename
+
+                  # Arquivo exclusivo do GitHub Pages.
+                  # Nao deve ser publicado no Cloudflare.
+                  if nome == ".nojekyll" and not item.is_dir():
+                      print("Ignorando .nojekyll")
+                      continue
+
                   caminho = PurePosixPath(nome)
                   partes = caminho.parts
+
 
                   if (
                       not partes
