@@ -1,4 +1,3 @@
-  
 name: Cloudflare Pages - QA
 
 on:
@@ -34,14 +33,14 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Extrair site.zip com seguranca
+      - name: Extrair e validar site.zip com seguranca
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path, PurePosixPath
-          import zipfile
           import shutil
           import stat
+          import zipfile
 
           arquivo = Path("site.zip")
           destino = Path("dist")
@@ -50,62 +49,62 @@ jobs:
               raise SystemExit("site.zip nao encontrado")
 
           destino.mkdir(exist_ok=True)
-
           with zipfile.ZipFile(arquivo) as zipf:
               itens = zipf.infolist()
-
               if len(itens) > 5000:
-                  raise SystemExit("Excesso de arquivos")
-
+                  raise SystemExit("Excesso de arquivos no ZIP")
               if sum(i.file_size for i in itens) > 350_000_000:
                   raise SystemExit("ZIP descompactado muito grande")
 
+              nomes_vistos = set()
               for item in itens:
                   nome = item.filename
-
-                  # Arquivo exclusivo do GitHub Pages.
-                  # Nao deve ser publicado no Cloudflare.
                   if nome == ".nojekyll" and not item.is_dir():
-                      print("Ignorando .nojekyll")
+                      print("Ignorando arquivo do GitHub Pages: .nojekyll")
                       continue
 
                   caminho = PurePosixPath(nome)
                   partes = caminho.parts
-
-
-                  if (
-                      not partes
-                      or caminho.is_absolute()
-                      or ".." in partes
-                      or "\\" in nome
-                      or ":" in partes[0]
-                  ):
+                  if (not partes or caminho.is_absolute() or ".." in partes
+                      or "\\" in nome or ":" in partes[0]):
                       raise SystemExit("Caminho inseguro: " + nome)
-
-                  if any(
-                      p.startswith(".") and p != ".well-known"
-                      for p in partes
-                  ):
+                  if any(p.startswith(".") and p != ".well-known" for p in partes):
                       raise SystemExit("Arquivo oculto nao permitido: " + nome)
-
                   modo = item.external_attr >> 16
                   if stat.S_ISLNK(modo) or item.flag_bits & 1:
-                      raise SystemExit("Entrada nao permitida: " + nome)
+                      raise SystemExit("Entrada insegura: " + nome)
+                  if not item.is_dir():
+                      if nome in nomes_vistos:
+                          raise SystemExit("Caminho duplicado: " + nome)
+                      nomes_vistos.add(nome)
+                      saida = destino.joinpath(*partes)
+                      saida.parent.mkdir(parents=True, exist_ok=True)
+                      with zipf.open(item) as src, saida.open("wb") as dst:
+                          shutil.copyfileobj(src, dst)
 
-                  if item.is_dir():
-                      continue
-
-                  saida = destino.joinpath(*partes)
-                  saida.parent.mkdir(parents=True, exist_ok=True)
-
-                  with zipf.open(item) as src, saida.open("wb") as dst:
-                      shutil.copyfileobj(src, dst)
-
-          for caminho in ["index.html", "js", "assets", "_headers"]:
+          for caminho in ("index.html", "js", "assets"):
               if not (destino / caminho).exists():
                   raise SystemExit("Recurso obrigatorio ausente: " + caminho)
 
-          print("Estrutura validada")
+          # O ZIP antigo foi criado para GitHub Pages e nao possui _headers.
+          # Reproduzimos a politica de seguranca usada no pacote de QA.
+          headers = destino / "_headers"
+          if not headers.is_file():
+              headers.write_text(
+                  "/*\n"
+                  "  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; worker-src 'none'; manifest-src 'self'; upgrade-insecure-requests\n"
+                  "  X-Content-Type-Options: nosniff\n"
+                  "  X-Frame-Options: DENY\n"
+                  "  Referrer-Policy: no-referrer\n"
+                  "  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()\n"
+                  "  Strict-Transport-Security: max-age=31536000\n"
+                  "  Cache-Control: public, max-age=0, must-revalidate\n",
+                  encoding="utf-8",
+              )
+              print("Criado dist/_headers para Cloudflare Pages")
+          if not headers.read_text(encoding="utf-8").strip():
+              raise SystemExit("_headers vazio")
+          print("Estrutura e seguranca do pacote validadas")
           PY
 
       - name: Validar sintaxe JavaScript
@@ -117,15 +116,26 @@ jobs:
       - name: Executar testes existentes
         shell: bash
         run: |
+          cd dist
           for teste in \
-            dist/tests/scenery_npcs.test.js \
-            dist/tests/sidewalk_runners.test.js \
-            dist/tests/combat_stamina.test.cjs
+            tests/scenery_npcs.test.js \
+            tests/sidewalk_runners.test.js \
+            tests/combat_stamina.test.cjs
           do
             if [ -f "$teste" ]; then
               node --test "$teste"
             fi
           done
+
+      - name: Remover arquivos de desenvolvimento da distribuicao
+        shell: bash
+        run: |
+          rm -rf dist/tests dist/docs dist/laboratorio
+          rm -f dist/*.md dist/VERSAO.txt dist/animacoes.html dist/teste_*.html
+          test -s dist/index.html
+          test -s dist/_headers
+          printf 'Arquivos preparados para QA: '
+          find dist -type f | wc -l
 
       - name: Salvar artefato validado
         uses: actions/upload-artifact@v4
@@ -139,16 +149,13 @@ jobs:
   publicar_qa:
     name: Publicar no Cloudflare QA
     needs: validar
-
     if: >-
       ${{
         inputs.operation == 'publicar-qa' &&
         github.ref == 'refs/heads/main'
       }}
-
     runs-on: ubuntu-latest
     environment: cloudflare-qa
-
     steps:
       - name: Baixar artefato validado
         uses: actions/download-artifact@v4
