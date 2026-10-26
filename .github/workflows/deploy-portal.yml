@@ -1,0 +1,176 @@
+name: Publicar PORTAL e JOGO no GitHub Pages
+
+# Manual para evitar substituir o jogo antigo inadvertidamente.
+# Use validar primeiro; publicar exige selecao consciente na aba Actions.
+on:
+  workflow_dispatch:
+    inputs:
+      operacao:
+        description: "Operacao: valide antes de publicar"
+        required: true
+        default: validar
+        type: choice
+        options:
+          - validar
+          - publicar
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  validar:
+    name: Conferir pacote integrado
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Preparar portal e jogo sem alterar original
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import shutil
+          import stat
+          import zipfile
+          from pathlib import Path, PurePosixPath
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit, unquote
+
+          bundle = Path('portal-site.zip')
+          out = Path('_site')
+          if not bundle.is_file():
+              raise SystemExit('ERRO: envie portal-site.zip na RAIZ do repositorio')
+          if out.exists():
+              shutil.rmtree(out)
+          out.mkdir()
+
+          allowed_root = {'index.html', '_headers', 'LICENSE_PORTAL.txt', '.nojekyll'}
+          allowed_first = {'jogo'}
+          written = set()
+          file_count = 0
+          total = 0
+
+          with zipfile.ZipFile(bundle) as archive:
+              for item in archive.infolist():
+                  raw = item.filename
+                  name = PurePosixPath(raw)
+                  parts = name.parts
+                  if (not parts or name.is_absolute() or '..' in parts
+                      or '\\' in raw or '\x00' in raw or ':' in parts[0]):
+                      raise SystemExit('ERRO: nome inseguro no ZIP: ' + repr(raw))
+                  if (str(name) not in allowed_root and parts[0] not in allowed_first):
+                      raise SystemExit('ERRO: arquivo nao esperado na raiz do ZIP: '+raw)
+                  if any(p.startswith('.') for p in parts if p != '.nojekyll'):
+                      raise SystemExit('ERRO: entrada oculta inesperada: '+raw)
+                  mode = item.external_attr >> 16
+                  if stat.S_ISLNK(mode) or item.flag_bits & 1:
+                      raise SystemExit('ERRO: link simbolico ou arquivo cifrado: '+raw)
+                  if item.is_dir():
+                      continue
+                  if raw in written:
+                      raise SystemExit('ERRO: arquivo duplicado no ZIP: '+raw)
+                  written.add(raw)
+                  file_count += 1
+                  total += item.file_size
+                  if file_count > 1200 or total > 160_000_000 or item.file_size > 25_000_000:
+                      raise SystemExit('ERRO: pacote excedeu os limites de seguranca')
+                  dest = out.joinpath(*parts)
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(item) as src, dest.open('wb') as dst:
+                      shutil.copyfileobj(src, dst)
+
+          for name in ('index.html', 'jogo/index.html', 'jogo/css/style.css', 'jogo/js/game.js'):
+              if not (out/name).is_file():
+                  raise SystemExit('ERRO: arquivo obrigatorio ausente: '+name)
+          portal = (out/'index.html').read_text(encoding='utf-8')
+          if 'href="./jogo/"' not in portal or 'href="/jogo/"' in portal:
+              raise SystemExit('ERRO: links do portal incompativeis com o subcaminho do GitHub Pages')
+          (out/'.nojekyll').touch()
+
+          class Links(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.refs = []
+              def handle_starttag(self, tag, attrs):
+                  values = dict(attrs)
+                  if tag in {'script', 'img', 'audio', 'video', 'source'} and values.get('src'):
+                      self.refs.append(values['src'])
+                  if tag == 'link' and values.get('href'):
+                      self.refs.append(values['href'])
+
+          checked = 0
+          for html in ('index.html', 'jogo/index.html'):
+              parser = Links()
+              parser.feed((out/html).read_text(encoding='utf-8'))
+              for url in parser.refs:
+                  p = urlsplit(url)
+                  if p.scheme or p.netloc or not p.path or url.startswith('#'):
+                      continue
+                  if p.path.startswith('/'):
+                      raise SystemExit('ERRO: URL absoluta em '+html+' -> '+url)
+                  rel = PurePosixPath(unquote(p.path))
+                  target = (out / PurePosixPath(html).parent / rel).resolve()
+                  if not target.is_relative_to(out.resolve()) or not target.is_file():
+                      raise SystemExit('ERRO: asset nao encontrado: '+html+' -> '+url)
+                  checked += 1
+          print(f'OK: {file_count} arquivos, {total/1e6:.1f} MB, {checked} links locais verificados.')
+          PY
+
+      - name: Validar JavaScript do jogo
+        shell: bash
+        run: |
+          n=0
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+            n=$((n+1))
+          done < <(find _site/jogo/js -type f -name '*.js' -print0)
+          test "$n" -gt 0
+          echo "Sintaxe OK em $n arquivos JS"
+
+      - name: Guardar artefato revisado
+        uses: actions/upload-artifact@v4
+        with:
+          name: portal-e-jogo-validado
+          path: _site/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  publicar:
+    name: Publicar no GitHub Pages (manual)
+    needs: validar
+    if: ${{ inputs.operacao == 'publicar' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Baixar pacote validado
+        uses: actions/download-artifact@v4
+        with:
+          name: portal-e-jogo-validado
+          path: _site
+
+      - name: Configurar GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Preparar artefato do GitHub Pages
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: PUBLICAR
+        id: deployment
+        uses: actions/deploy-pages@v4
