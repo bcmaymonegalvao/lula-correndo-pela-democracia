@@ -1,0 +1,306 @@
+name: Cloudflare Pages - PORTAL e JOGO (QA)
+
+# Somente execucao manual. Nenhum push/commit publica na Cloudflare.
+on:
+  workflow_dispatch:
+    inputs:
+      operacao:
+        description: "Validar pacote ou publicar no Cloudflare QA?"
+        required: true
+        type: choice
+        default: validar
+        options:
+          - validar
+          - publicar-qa
+      confirmo_revisao_juridica:
+        description: "Para publicar: revisao de direitos, imagem, trilha e regras aplicaveis concluida?"
+        type: boolean
+        required: true
+        default: false
+      autorizo_publicacao_qa:
+        description: "Para publicar: autorizo expressamente a exposicao publica no Cloudflare QA?"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+# O workflow antigo de Cloudflare tambem usa este grupo.
+concurrency:
+  group: cloudflare-pages-qa
+  cancel-in-progress: false
+
+jobs:
+  validar:
+    name: Validar portal integrado (sem publicar)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Obter repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Preparar Node.js para checagem de sintaxe
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Extrair ZIP com seguranca e validar rotas
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit, unquote
+          import hashlib
+          import re
+          import shutil
+          import stat
+          import zipfile
+
+          archive_path = Path('portal-site.zip')
+          output = Path('dist')
+          if not archive_path.is_file():
+              raise SystemExit('ERRO: portal-site.zip ausente na raiz do repositorio.')
+          if not zipfile.is_zipfile(archive_path):
+              raise SystemExit('ERRO: portal-site.zip invalido.')
+          if output.exists():
+              shutil.rmtree(output)
+          output.mkdir()
+
+          allowed_root = {'index.html', '_headers', 'LICENSE_PORTAL.txt', '.nojekyll'}
+          seen = set()
+          files = 0
+          total_bytes = 0
+          game_hashes = {}
+          with zipfile.ZipFile(archive_path) as archive:
+              for info in archive.infolist():
+                  filename = info.filename
+                  path = PurePosixPath(filename)
+                  if (not path.parts or path.is_absolute() or '..' in path.parts
+                          or '\\' in filename or '\x00' in filename or ':' in path.parts[0]):
+                      raise SystemExit('ERRO: caminho inseguro: ' + repr(filename))
+                  if (path.parts[0] != 'jogo' and str(path) not in allowed_root):
+                      raise SystemExit('ERRO: entrada fora da estrutura do portal: ' + filename)
+                  if any(part.startswith('.') and part != '.nojekyll' for part in path.parts):
+                      raise SystemExit('ERRO: arquivo oculto inesperado: ' + filename)
+                  mode = info.external_attr >> 16
+                  if stat.S_ISLNK(mode) or info.flag_bits & 1:
+                      raise SystemExit('ERRO: links simbolicos/arquivos cifrados nao permitidos: ' + filename)
+                  if info.is_dir():
+                      continue
+                  if filename in seen:
+                      raise SystemExit('ERRO: arquivo repetido no ZIP: ' + filename)
+                  seen.add(filename)
+                  files += 1
+                  total_bytes += info.file_size
+                  if (files > 1200 or total_bytes > 160_000_000 or info.file_size > 25_000_000):
+                      raise SystemExit('ERRO: limite de quantidade/tamanho excedido.')
+                  target = output.joinpath(*path.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  sha = hashlib.sha256()
+                  with archive.open(info) as source, target.open('wb') as dest:
+                      while True:
+                          block = source.read(1024 * 1024)
+                          if not block:
+                              break
+                          sha.update(block)
+                          dest.write(block)
+                  if filename.startswith('jogo/'):
+                      game_hashes[filename] = sha.hexdigest()
+
+          required = (
+              'index.html', '_headers', 'jogo/index.html',
+              'jogo/css/style.css', 'jogo/js/game.js',
+          )
+          for rel in required:
+              if not (output / rel).is_file():
+                  raise SystemExit('ERRO: arquivo obrigatorio ausente: ' + rel)
+
+          portal_html = (output / 'index.html').read_text(encoding='utf-8')
+          game_html = (output / 'jogo/index.html').read_text(encoding='utf-8')
+          if 'href="./jogo/"' not in portal_html:
+              raise SystemExit('ERRO: botao JOGAR AGORA nao aponta para ./jogo/.')
+          if 'href="/jogo/"' in portal_html:
+              raise SystemExit('ERRO: link absoluto /jogo/ incorreto no portal.')
+          if '<base ' in portal_html.lower() or '<base ' in game_html.lower():
+              raise SystemExit('ERRO: tag <base> altera resolucao de URLs relativas.')
+          for forbidden in ('/api/v1/',):
+              if forbidden in portal_html and 'fetch(' in portal_html:
+                  raise SystemExit('ERRO: integracao de API nao autorizada no portal QA.')
+
+          class AssetRefs(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.urls = []
+              def handle_starttag(self, tag, attrs):
+                  values = dict(attrs)
+                  if tag in {'script', 'img', 'audio', 'video', 'source'} and values.get('src'):
+                      self.urls.append(values['src'])
+                  if tag == 'link' and values.get('href'):
+                      self.urls.append(values['href'])
+
+          links = 0
+          for rel in ('index.html', 'jogo/index.html'):
+              parser = AssetRefs()
+              parser.feed((output / rel).read_text(encoding='utf-8'))
+              for url in parser.urls:
+                  parts = urlsplit(url)
+                  if parts.scheme in {'data', 'blob'}:
+                      continue
+                  if parts.scheme or parts.netloc or not parts.path or url.startswith('#'):
+                      continue
+                  if parts.path.startswith('/'):
+                      raise SystemExit('ERRO: asset referenciado por caminho absoluto: ' + rel + ' -> ' + url)
+                  local = (output / PurePosixPath(rel).parent / unquote(parts.path)).resolve()
+                  if not local.is_relative_to(output.resolve()) or not local.is_file():
+                      raise SystemExit('ERRO: asset nao encontrado: ' + rel + ' -> ' + url)
+                  links += 1
+
+          # Integridade: nenhuma alteracao aos arquivos do jogo ao montar o portal.
+          for rel, expected_hash in game_hashes.items():
+              actual = hashlib.sha256((output / rel).read_bytes()).hexdigest()
+              if actual != expected_hash:
+                  raise SystemExit('ERRO: jogo alterado durante a montagem: ' + rel)
+
+          # Cloudflare processa apenas _headers na raiz do diretorio publicado.
+          # A regra CSP encontrada em jogo/_headers vira regra para /jogo/*.
+          game_headers = (output / 'jogo/_headers')
+          if not game_headers.is_file():
+              raise SystemExit('ERRO: jogo/_headers ausente: revisar politicas antes de publicar.')
+          match = re.search(r'^\s*Content-Security-Policy:\s*(.+)\s*$',
+                            game_headers.read_text(encoding='utf-8'), re.M)
+          if not match:
+              raise SystemExit('ERRO: CSP original do jogo nao encontrada.')
+          game_csp = match.group(1).strip()
+          if not game_csp.startswith("default-src 'none'"):
+              raise SystemExit('ERRO: politica do jogo mudou; revisar a CSP.')
+
+          # Portal e auto-contido e usa um script executavel inline.
+          # SHA256 permite o script sem liberar unsafe-inline para scripts.
+          inline = re.findall(r'<script\b([^>]*)>(.*?)</script\s*>',
+                              portal_html, flags=re.I | re.S)
+          executable = [body for attrs, body in inline
+                        if not re.search(r'\bsrc\s*=', attrs, flags=re.I)
+                        and not re.search(r'\btype\s*=\s*["\']application/json["\']', attrs, flags=re.I)]
+          if len(executable) != 1:
+              raise SystemExit('ERRO: scripts do portal mudaram: revisar a CSP.')
+          import base64
+          script_hash = base64.b64encode(hashlib.sha256(executable[0].encode('utf-8')).digest()).decode('ascii')
+          portal_csp = (
+              "default-src 'none'; script-src 'self' 'sha256-" + script_hash + "'; "
+              "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+              "media-src 'self' blob:; font-src 'self' data:; connect-src 'none'; "
+              "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+              "form-action 'none'; worker-src 'none'; upgrade-insecure-requests"
+          )
+          root_headers = (output / '_headers')
+          original_rules = root_headers.read_text(encoding='utf-8').rstrip()
+          if not original_rules.startswith('/*') or 'Content-Security-Policy:' in original_rules:
+              raise SystemExit('ERRO: regras gerais de _headers alteradas; revisar antes de publicar.')
+          combined = (
+              original_rules + '\n  X-Robots-Tag: noindex, nofollow\n\n'
+              '/\n  Content-Security-Policy: ' + portal_csp + '\n\n'
+              '/jogo/*\n  Content-Security-Policy: ' + game_csp + '\n'
+          )
+          if max(map(len, combined.splitlines())) > 2000:
+              raise SystemExit('ERRO: linha muito longa no arquivo _headers (Cloudflare).')
+          root_headers.write_text(combined, encoding='utf-8')
+
+          # A configuracao aninhada nao sera interpretada como _headers pelo Pages.
+          # Remover SOMENTE da pasta de publicacao evita servir politica como asset.
+          game_headers.unlink()
+          (output / '.nojekyll').touch()
+          print(f'OK: {files} arquivos, {total_bytes/1_000_000:.1f} MB, {links} refs locais, '
+                f'{len(game_hashes)} arquivos do jogo integres, CSP por rota configurada.')
+          PY
+
+      - name: Verificar JavaScript do jogo
+        shell: bash
+        run: |
+          set -euo pipefail
+          n=0
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+            n=$((n+1))
+          done < <(find dist/jogo/js -type f -name '*.js' -print0)
+          test "$n" -gt 0
+          echo "OK: sintaxe valida em $n arquivos JavaScript."
+
+      - name: Verificar respostas HTTP locais (smoke test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8799 --directory dist >/tmp/portal-http.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:8799/; then break; fi
+            sleep 1
+          done
+          for path in '/' '/jogo/' '/jogo/js/game.js' '/jogo/css/style.css'; do
+            curl --fail --silent --show-error --output /dev/null "http://127.0.0.1:8799$path"
+            echo "HTTP local OK: $path"
+          done
+
+      - name: Salvar pacote de QA validado
+        uses: actions/upload-artifact@v4
+        with:
+          name: portal-cloudflare-qa-validado
+          path: dist/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  publicar_qa:
+    name: PUBLICAR portal no Cloudflare QA (com gates)
+    needs: validar
+    if: ${{ inputs.operacao == 'publicar-qa' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: cloudflare-qa
+    permissions:
+      contents: read
+    steps:
+      - name: Exigir autorizacao e revisao juridica
+        shell: bash
+        env:
+          CONFIRMO_REVISAO: ${{ inputs.confirmo_revisao_juridica }}
+          AUTORIZO_QA: ${{ inputs.autorizo_publicacao_qa }}
+        run: |
+          if [ "$CONFIRMO_REVISAO" != 'true' ] || [ "$AUTORIZO_QA" != 'true' ]; then
+            echo '::error::Publicacao bloqueada. Concluir revisao juridica e autorizar exposicao publica do QA.'
+            exit 1
+          fi
+
+      - name: Usar exatamente o pacote previamente validado
+        uses: actions/download-artifact@v4
+        with:
+          name: portal-cloudflare-qa-validado
+          path: dist
+
+      - name: Confirmar arquivos e headers antes do deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/index.html
+          test -s dist/jogo/index.html
+          test -s dist/jogo/js/game.js
+          test -s dist/_headers
+          grep -q '^/jogo/\*' dist/_headers
+          grep -q 'X-Robots-Tag: noindex' dist/_headers
+          if find dist \( -name '.git' -o -name '.github' -o -name '.env' \) -print | grep -q .; then
+            echo '::error::Arquivos privados detectados na distribuicao.'
+            exit 1
+          fi
+
+      - name: Publicar no projeto EXISTENTE Cloudflare Pages QA
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.152.0'
+          command: pages deploy dist --project-name=lula-correndo-democracia-qa --branch=main
