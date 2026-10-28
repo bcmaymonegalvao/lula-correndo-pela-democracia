@@ -1,4 +1,4 @@
-name: Cloudflare Pages - PORTAL e JOGO (QA)
+name: Cloudflare Pages - PORTAL V12 e JOGO (QA)
 
 # Somente execucao manual. Nenhum push/commit publica na Cloudflare.
 on:
@@ -83,7 +83,7 @@ jobs:
                   if (not path.parts or path.is_absolute() or '..' in path.parts
                           or '\\' in filename or '\x00' in filename or ':' in path.parts[0]):
                       raise SystemExit('ERRO: caminho inseguro: ' + repr(filename))
-                  if (path.parts[0] != 'jogo' and str(path) not in allowed_root):
+                  if (path.parts[0] not in ('jogo', 'abertura') and str(path) not in allowed_root):
                       raise SystemExit('ERRO: entrada fora da estrutura do portal: ' + filename)
                   if any(part.startswith('.') and part != '.nojekyll' for part in path.parts):
                       raise SystemExit('ERRO: arquivo oculto inesperado: ' + filename)
@@ -115,6 +115,7 @@ jobs:
           required = (
               'index.html', '_headers', 'jogo/index.html',
               'jogo/css/style.css', 'jogo/js/game.js',
+              'abertura/index.html', 'abertura/assets/cenario.webp', 'abertura/assets/lula.webp',
           )
           for rel in required:
               if not (output / rel).is_file():
@@ -122,6 +123,15 @@ jobs:
 
           portal_html = (output / 'index.html').read_text(encoding='utf-8')
           game_html = (output / 'jogo/index.html').read_text(encoding='utf-8')
+          v12_html = (output / 'abertura/index.html').read_text(encoding='utf-8')
+          if 'data-v12-src="./abertura/"' not in portal_html or 'data-v12-replay' not in portal_html:
+              raise SystemExit('ERRO: iframe/controle da V12 nao presentes')
+          if '01 / SURGEM' not in v12_html or '02 / PISCADA' not in v12_html or '03 / ABREM' not in v12_html or '04 / REVELAÇÃO FINAL' not in v12_html:
+              raise SystemExit('ERRO: sequencia original V12 ausente')
+          for name in ('cenario','erika','ana','tariflavio','lula','jones','janones'):
+              rel='assets/'+name+'.webp'
+              if rel not in v12_html or not (output/'abertura'/rel).is_file():
+                  raise SystemExit('ERRO: imagem V12 ausente: '+rel)
           if 'href="./jogo/"' not in portal_html:
               raise SystemExit('ERRO: botao JOGAR AGORA nao aponta para ./jogo/.')
           if 'href="/jogo/"' in portal_html:
@@ -138,13 +148,13 @@ jobs:
                   self.urls = []
               def handle_starttag(self, tag, attrs):
                   values = dict(attrs)
-                  if tag in {'script', 'img', 'audio', 'video', 'source'} and values.get('src'):
+                  if tag in {'script', 'img', 'audio', 'video', 'source', 'iframe'} and values.get('src'):
                       self.urls.append(values['src'])
                   if tag == 'link' and values.get('href'):
                       self.urls.append(values['href'])
 
           links = 0
-          for rel in ('index.html', 'jogo/index.html'):
+          for rel in ('index.html', 'jogo/index.html', 'abertura/index.html'):
               parser = AssetRefs()
               parser.feed((output / rel).read_text(encoding='utf-8'))
               for url in parser.urls:
@@ -160,6 +170,10 @@ jobs:
                       raise SystemExit('ERRO: asset nao encontrado: ' + rel + ' -> ' + url)
                   links += 1
 
+          # Verificar links CSS url da V12 (as imagens convertidas sao lossless).
+          for asset in re.findall(r'url\(\"?(assets/[^\"\)]+)',v12_html):
+              if not (output/'abertura'/asset).is_file():
+                  raise SystemExit('ERRO: CSS referencia arquivo ausente: '+asset)
           # Integridade: nenhuma alteracao aos arquivos do jogo ao montar o portal.
           for rel, expected_hash in game_hashes.items():
               actual = hashlib.sha256((output / rel).read_bytes()).hexdigest()
@@ -179,32 +193,45 @@ jobs:
           if not game_csp.startswith("default-src 'none'"):
               raise SystemExit('ERRO: politica do jogo mudou; revisar a CSP.')
 
-          # Portal e auto-contido e usa um script executavel inline.
-          # SHA256 permite o script sem liberar unsafe-inline para scripts.
-          inline = re.findall(r'<script\b([^>]*)>(.*?)</script\s*>',
-                              portal_html, flags=re.I | re.S)
-          executable = [body for attrs, body in inline
-                        if not re.search(r'\bsrc\s*=', attrs, flags=re.I)
-                        and not re.search(r'\btype\s*=\s*["\']application/json["\']', attrs, flags=re.I)]
-          if len(executable) != 1:
-              raise SystemExit('ERRO: scripts do portal mudaram: revisar a CSP.')
+          # Hash CSP exato dos dois scripts inline do portal e dois da V12.
+          # Nenhuma permissao de unsafe-inline para scripts.
           import base64
-          script_hash = base64.b64encode(hashlib.sha256(executable[0].encode('utf-8')).digest()).decode('ascii')
-          portal_csp = (
-              "default-src 'none'; script-src 'self' 'sha256-" + script_hash + "'; "
+          def inline_hashes(html):
+              scripts = re.findall(r'<script\b([^>]*)>(.*?)</script\s*>',html,flags=re.I|re.S)
+              bodies=[body for attrs,body in scripts if not re.search(r'\bsrc\s*=',attrs,flags=re.I)
+                      and not re.search(r'\btype\s*=\s*["\']application/json["\']',attrs,flags=re.I)]
+              return ["'sha256-" + base64.b64encode(hashlib.sha256(b.encode('utf-8')).digest()).decode('ascii') + "'" for b in bodies]
+          hashes_portal=inline_hashes(portal_html)
+          hashes_v12=inline_hashes(v12_html)
+          if len(hashes_portal)!=2 or len(hashes_v12)!=2:
+              raise SystemExit('ERRO: quantidade de scripts inline mudou; revisar CSP')
+          portal_csp=(
+              "default-src 'none'; script-src 'self' " + ' '.join(hashes_portal) + "; "
               "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
               "media-src 'self' blob:; font-src 'self' data:; connect-src 'none'; "
-              "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+              "frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
               "form-action 'none'; worker-src 'none'; upgrade-insecure-requests"
+          )
+          v12_csp=(
+              "default-src 'none'; script-src " + ' '.join(hashes_v12) + "; "
+              "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+              "connect-src 'none'; frame-src 'none'; object-src 'none'; "
+              "base-uri 'none'; frame-ancestors 'self'; form-action 'none'; "
+              "upgrade-insecure-requests"
           )
           root_headers = (output / '_headers')
           original_rules = root_headers.read_text(encoding='utf-8').rstrip()
           if not original_rules.startswith('/*') or 'Content-Security-Policy:' in original_rules:
               raise SystemExit('ERRO: regras gerais de _headers alteradas; revisar antes de publicar.')
+          if 'X-Frame-Options: SAMEORIGIN' not in original_rules:
+              raise SystemExit('ERRO: V12 exige permitir iframe da mesma origem')
           combined = (
               original_rules + '\n  X-Robots-Tag: noindex, nofollow\n\n'
               '/\n  Content-Security-Policy: ' + portal_csp + '\n\n'
+              '/abertura/*\n  Content-Security-Policy: ' + v12_csp + '\n'
+              '  X-Frame-Options: SAMEORIGIN\n\n'
               '/jogo/*\n  Content-Security-Policy: ' + game_csp + '\n'
+              '  X-Frame-Options: DENY\n'
           )
           if max(map(len, combined.splitlines())) > 2000:
               raise SystemExit('ERRO: linha muito longa no arquivo _headers (Cloudflare).')
@@ -241,7 +268,7 @@ jobs:
             if curl --fail --silent --output /dev/null http://127.0.0.1:8799/; then break; fi
             sleep 1
           done
-          for path in '/' '/jogo/' '/jogo/js/game.js' '/jogo/css/style.css'; do
+          for path in '/' '/abertura/' '/abertura/assets/lula.webp' '/jogo/' '/jogo/js/game.js' '/jogo/css/style.css'; do
             curl --fail --silent --show-error --output /dev/null "http://127.0.0.1:8799$path"
             echo "HTTP local OK: $path"
           done
@@ -288,9 +315,12 @@ jobs:
           set -euo pipefail
           test -s dist/index.html
           test -s dist/jogo/index.html
+          test -s dist/abertura/index.html
+          test -s dist/abertura/assets/lula.webp
           test -s dist/jogo/js/game.js
           test -s dist/_headers
           grep -q '^/jogo/\*' dist/_headers
+          grep -q '^/abertura/\*' dist/_headers
           grep -q 'X-Robots-Tag: noindex' dist/_headers
           if find dist \( -name '.git' -o -name '.github' -o -name '.env' \) -print | grep -q .; then
             echo '::error::Arquivos privados detectados na distribuicao.'
