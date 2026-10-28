@@ -1,4 +1,4 @@
-name: Publicar PORTAL e JOGO no GitHub Pages
+name: Publicar PORTAL V12 e JOGO no GitHub Pages
 
 # Manual para evitar substituir o jogo antigo inadvertidamente.
 # Use validar primeiro; publicar exige selecao consciente na aba Actions.
@@ -52,7 +52,7 @@ jobs:
           out.mkdir()
 
           allowed_root = {'index.html', '_headers', 'LICENSE_PORTAL.txt', '.nojekyll'}
-          allowed_first = {'jogo'}
+          allowed_first = {'jogo', 'abertura'}
           written = set()
           file_count = 0
           total = 0
@@ -86,12 +86,21 @@ jobs:
                   with archive.open(item) as src, dest.open('wb') as dst:
                       shutil.copyfileobj(src, dst)
 
-          for name in ('index.html', 'jogo/index.html', 'jogo/css/style.css', 'jogo/js/game.js'):
+          for name in ('index.html', 'jogo/index.html', 'jogo/css/style.css', 'jogo/js/game.js', 'abertura/index.html', 'abertura/assets/cenario.webp', 'abertura/assets/lula.webp'):
               if not (out/name).is_file():
                   raise SystemExit('ERRO: arquivo obrigatorio ausente: '+name)
           portal = (out/'index.html').read_text(encoding='utf-8')
           if 'href="./jogo/"' not in portal or 'href="/jogo/"' in portal:
               raise SystemExit('ERRO: links do portal incompativeis com o subcaminho do GitHub Pages')
+          if 'data-v12-src="./abertura/"' not in portal or 'data-v12-replay' not in portal:
+              raise SystemExit('ERRO: V12 nao ligada a homepage ou replay nao encontrado')
+          abertura = (out/'abertura/index.html').read_text(encoding='utf-8')
+          for asset in ('cenario', 'erika', 'ana', 'tariflavio', 'lula', 'jones', 'janones'):
+              rel = 'assets/' + asset + '.webp'
+              if rel not in abertura or not (out/'abertura'/rel).is_file():
+                  raise SystemExit('ERRO: imagem V12 ausente: '+rel)
+          if 'portal-v12' not in abertura or '01 / SURGEM' not in abertura or '02 / PISCADA' not in abertura:
+              raise SystemExit('ERRO: abertura cinematografica V12 ou ponte de evento ausente')
           (out/'.nojekyll').touch()
 
           class Links(HTMLParser):
@@ -100,13 +109,13 @@ jobs:
                   self.refs = []
               def handle_starttag(self, tag, attrs):
                   values = dict(attrs)
-                  if tag in {'script', 'img', 'audio', 'video', 'source'} and values.get('src'):
+                  if tag in {'script', 'img', 'audio', 'video', 'source', 'iframe'} and values.get('src'):
                       self.refs.append(values['src'])
                   if tag == 'link' and values.get('href'):
                       self.refs.append(values['href'])
 
           checked = 0
-          for html in ('index.html', 'jogo/index.html'):
+          for html in ('index.html', 'jogo/index.html', 'abertura/index.html'):
               parser = Links()
               parser.feed((out/html).read_text(encoding='utf-8'))
               for url in parser.refs:
@@ -120,6 +129,8 @@ jobs:
                   if not target.is_relative_to(out.resolve()) or not target.is_file():
                       raise SystemExit('ERRO: asset nao encontrado: '+html+' -> '+url)
                   checked += 1
+          if (out/'_headers').read_text().count('X-Frame-Options: SAMEORIGIN')!=1:
+              raise SystemExit('ERRO: V12 iframe necessita X-Frame-Options SAMEORIGIN na raiz')
           print(f'OK: {file_count} arquivos, {total/1e6:.1f} MB, {checked} links locais verificados.')
           PY
 
