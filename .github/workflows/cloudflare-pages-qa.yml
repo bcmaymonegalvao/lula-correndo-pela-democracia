@@ -1,202 +1,333 @@
-name: Cloudflare Pages - QA
+name: Cloudflare Pages - PORTAL V12 e JOGO (QA)
 
-# Nenhum commit publica o jogo automaticamente.
+# Somente execucao manual. Nenhum push/commit publica na Cloudflare.
 on:
   workflow_dispatch:
     inputs:
-      operation:
-        description: "O que deseja executar?"
+      operacao:
+        description: "Validar pacote ou publicar no Cloudflare QA?"
         required: true
         type: choice
         default: validar
         options:
           - validar
           - publicar-qa
+      confirmo_revisao_juridica:
+        description: "Para publicar: revisao de direitos, imagem, trilha e regras aplicaveis concluida?"
+        type: boolean
+        required: true
+        default: false
+      autorizo_publicacao_qa:
+        description: "Para publicar: autorizo expressamente a exposicao publica no Cloudflare QA?"
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
 
+# O workflow antigo de Cloudflare tambem usa este grupo.
 concurrency:
   group: cloudflare-pages-qa
   cancel-in-progress: false
 
 jobs:
   validar:
-    name: Validar o jogo
+    name: Validar portal integrado (sem publicar)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
-      - name: Obter arquivos do repositorio
-        uses: actions/checkout@v6
+      - name: Obter repositorio
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Preparar Node.js
-        uses: actions/setup-node@v6
+      - name: Preparar Node.js para checagem de sintaxe
+        uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: '22'
           package-manager-cache: false
 
-      - name: Extrair e conferir site.zip
+      - name: Extrair ZIP com seguranca e validar rotas
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path, PurePosixPath
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit, unquote
+          import hashlib
+          import re
           import shutil
           import stat
           import zipfile
 
-          origem = Path('site.zip')
-          destino = Path('dist')
-          if not origem.is_file():
-              raise SystemExit('ERRO: site.zip nao encontrado na raiz do repositorio')
-          if destino.exists():
-              shutil.rmtree(destino)
-          destino.mkdir()
+          archive_path = Path('portal-site.zip')
+          output = Path('dist')
+          if not archive_path.is_file():
+              raise SystemExit('ERRO: portal-site.zip ausente na raiz do repositorio.')
+          if not zipfile.is_zipfile(archive_path):
+              raise SystemExit('ERRO: portal-site.zip invalido.')
+          if output.exists():
+              shutil.rmtree(output)
+          output.mkdir()
 
-          with zipfile.ZipFile(origem) as pacote:
-              itens = pacote.infolist()
-              if len(itens) > 5000:
-                  raise SystemExit('ERRO: ZIP possui arquivos demais')
-              if sum(item.file_size for item in itens) > 350_000_000:
-                  raise SystemExit('ERRO: ZIP descompactado excede o limite')
-
-              nomes = set()
-              for item in itens:
-                  nome = item.filename
-                  if nome == '.nojekyll' and not item.is_dir():
-                      print('Ignorando .nojekyll (exclusivo do GitHub Pages)')
+          allowed_root = {'index.html', '_headers', 'LICENSE_PORTAL.txt', '.nojekyll'}
+          seen = set()
+          files = 0
+          total_bytes = 0
+          game_hashes = {}
+          with zipfile.ZipFile(archive_path) as archive:
+              for info in archive.infolist():
+                  filename = info.filename
+                  path = PurePosixPath(filename)
+                  if (not path.parts or path.is_absolute() or '..' in path.parts
+                          or '\\' in filename or '\x00' in filename or ':' in path.parts[0]):
+                      raise SystemExit('ERRO: caminho inseguro: ' + repr(filename))
+                  if (path.parts[0] not in ('jogo', 'abertura') and str(path) not in allowed_root):
+                      raise SystemExit('ERRO: entrada fora da estrutura do portal: ' + filename)
+                  if any(part.startswith('.') and part != '.nojekyll' for part in path.parts):
+                      raise SystemExit('ERRO: arquivo oculto inesperado: ' + filename)
+                  mode = info.external_attr >> 16
+                  if stat.S_ISLNK(mode) or info.flag_bits & 1:
+                      raise SystemExit('ERRO: links simbolicos/arquivos cifrados nao permitidos: ' + filename)
+                  if info.is_dir():
                       continue
-                  caminho = PurePosixPath(nome)
-                  partes = caminho.parts
-                  if (not partes or caminho.is_absolute() or '..' in partes
-                      or '\\' in nome or ':' in partes[0]):
-                      raise SystemExit('ERRO: caminho inseguro no ZIP: ' + nome)
-                  if any(p.startswith('.') and p != '.well-known' for p in partes):
-                      raise SystemExit('ERRO: arquivo oculto proibido: ' + nome)
-                  modo = item.external_attr >> 16
-                  if stat.S_ISLNK(modo) or item.flag_bits & 1:
-                      raise SystemExit('ERRO: link simbolico ou entrada cifrada: ' + nome)
-                  if item.is_dir():
+                  if filename in seen:
+                      raise SystemExit('ERRO: arquivo repetido no ZIP: ' + filename)
+                  seen.add(filename)
+                  files += 1
+                  total_bytes += info.file_size
+                  if (files > 1200 or total_bytes > 160_000_000 or info.file_size > 25_000_000):
+                      raise SystemExit('ERRO: limite de quantidade/tamanho excedido.')
+                  target = output.joinpath(*path.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  sha = hashlib.sha256()
+                  with archive.open(info) as source, target.open('wb') as dest:
+                      while True:
+                          block = source.read(1024 * 1024)
+                          if not block:
+                              break
+                          sha.update(block)
+                          dest.write(block)
+                  if filename.startswith('jogo/'):
+                      game_hashes[filename] = sha.hexdigest()
+
+          required = (
+              'index.html', '_headers', 'jogo/index.html',
+              'jogo/css/style.css', 'jogo/js/game.js',
+              'abertura/index.html', 'abertura/assets/cenario.webp', 'abertura/assets/lula.webp',
+          )
+          for rel in required:
+              if not (output / rel).is_file():
+                  raise SystemExit('ERRO: arquivo obrigatorio ausente: ' + rel)
+
+          portal_html = (output / 'index.html').read_text(encoding='utf-8')
+          game_html = (output / 'jogo/index.html').read_text(encoding='utf-8')
+          v12_html = (output / 'abertura/index.html').read_text(encoding='utf-8')
+          if 'data-v12-src="./abertura/"' not in portal_html or 'data-v12-replay' not in portal_html:
+              raise SystemExit('ERRO: iframe/controle da V12 nao presentes')
+          if '01 / SURGEM' not in v12_html or '02 / PISCADA' not in v12_html or '03 / ABREM' not in v12_html or '04 / REVELAÇÃO FINAL' not in v12_html:
+              raise SystemExit('ERRO: sequencia original V12 ausente')
+          for name in ('cenario','erika','ana','tariflavio','lula','jones','janones'):
+              rel='assets/'+name+'.webp'
+              if rel not in v12_html or not (output/'abertura'/rel).is_file():
+                  raise SystemExit('ERRO: imagem V12 ausente: '+rel)
+          if 'href="./jogo/"' not in portal_html:
+              raise SystemExit('ERRO: botao JOGAR AGORA nao aponta para ./jogo/.')
+          if 'href="/jogo/"' in portal_html:
+              raise SystemExit('ERRO: link absoluto /jogo/ incorreto no portal.')
+          if '<base ' in portal_html.lower() or '<base ' in game_html.lower():
+              raise SystemExit('ERRO: tag <base> altera resolucao de URLs relativas.')
+          for forbidden in ('/api/v1/',):
+              if forbidden in portal_html and 'fetch(' in portal_html:
+                  raise SystemExit('ERRO: integracao de API nao autorizada no portal QA.')
+
+          class AssetRefs(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.urls = []
+              def handle_starttag(self, tag, attrs):
+                  values = dict(attrs)
+                  if tag in {'script', 'img', 'audio', 'video', 'source', 'iframe'} and values.get('src'):
+                      self.urls.append(values['src'])
+                  if tag == 'link' and values.get('href'):
+                      self.urls.append(values['href'])
+
+          links = 0
+          for rel in ('index.html', 'jogo/index.html', 'abertura/index.html'):
+              parser = AssetRefs()
+              parser.feed((output / rel).read_text(encoding='utf-8'))
+              for url in parser.urls:
+                  parts = urlsplit(url)
+                  if parts.scheme in {'data', 'blob'}:
                       continue
-                  if nome in nomes:
-                      raise SystemExit('ERRO: arquivo duplicado no ZIP: ' + nome)
-                  nomes.add(nome)
-                  saida = destino.joinpath(*partes)
-                  saida.parent.mkdir(parents=True, exist_ok=True)
-                  with pacote.open(item) as entrada, saida.open('wb') as arquivo:
-                      shutil.copyfileobj(entrada, arquivo)
+                  if parts.scheme or parts.netloc or not parts.path or url.startswith('#'):
+                      continue
+                  if parts.path.startswith('/'):
+                      raise SystemExit('ERRO: asset referenciado por caminho absoluto: ' + rel + ' -> ' + url)
+                  local = (output / PurePosixPath(rel).parent / unquote(parts.path)).resolve()
+                  if not local.is_relative_to(output.resolve()) or not local.is_file():
+                      raise SystemExit('ERRO: asset nao encontrado: ' + rel + ' -> ' + url)
+                  links += 1
 
-          for nome in ('index.html', 'js', 'assets', 'tests'):
-              if not (destino / nome).exists():
-                  raise SystemExit('ERRO: recurso obrigatorio ausente no ZIP: ' + nome)
-          if not (destino / 'index.html').is_file():
-              raise SystemExit('ERRO: index.html precisa estar na raiz do ZIP')
+          # Verificar links CSS url da V12 (as imagens convertidas sao lossless).
+          for asset in re.findall(r'url\(\"?(assets/[^\"\)]+)',v12_html):
+              if not (output/'abertura'/asset).is_file():
+                  raise SystemExit('ERRO: CSS referencia arquivo ausente: '+asset)
+          # Integridade: nenhuma alteracao aos arquivos do jogo ao montar o portal.
+          for rel, expected_hash in game_hashes.items():
+              actual = hashlib.sha256((output / rel).read_bytes()).hexdigest()
+              if actual != expected_hash:
+                  raise SystemExit('ERRO: jogo alterado durante a montagem: ' + rel)
 
-          # Mesma politica de cabecalhos do pacote QA previamente testado.
-          headers = destino / '_headers'
-          if not headers.is_file():
-              headers.write_text(
-                  '/*\n'
-                  "  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; worker-src 'none'; manifest-src 'self'; upgrade-insecure-requests\n"
-                  '  X-Content-Type-Options: nosniff\n'
-                  '  X-Frame-Options: DENY\n'
-                  '  Referrer-Policy: no-referrer\n'
-                  '  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()\n'
-                  '  Strict-Transport-Security: max-age=31536000\n'
-                  '  Cache-Control: public, max-age=0, must-revalidate\n',
-                  encoding='utf-8',
-              )
-              print('Gerado dist/_headers para Cloudflare Pages')
-          conteudo = headers.read_text(encoding='utf-8')
-          if 'Content-Security-Policy:' not in conteudo or 'X-Frame-Options:' not in conteudo:
-              raise SystemExit('ERRO: _headers sem CSP e protecao contra iframes')
+          # Cloudflare processa apenas _headers na raiz do diretorio publicado.
+          # A regra CSP encontrada em jogo/_headers vira regra para /jogo/*.
+          game_headers = (output / 'jogo/_headers')
+          if not game_headers.is_file():
+              raise SystemExit('ERRO: jogo/_headers ausente: revisar politicas antes de publicar.')
+          match = re.search(r'^\s*Content-Security-Policy:\s*(.+)\s*$',
+                            game_headers.read_text(encoding='utf-8'), re.M)
+          if not match:
+              raise SystemExit('ERRO: CSP original do jogo nao encontrada.')
+          game_csp = match.group(1).strip()
+          if not game_csp.startswith("default-src 'none'"):
+              raise SystemExit('ERRO: politica do jogo mudou; revisar a CSP.')
 
-          print('ZIP extraido com seguranca e estrutura validada')
+          # Hash CSP exato dos dois scripts inline do portal e dois da V12.
+          # Nenhuma permissao de unsafe-inline para scripts.
+          import base64
+          def inline_hashes(html):
+              scripts = re.findall(r'<script\b([^>]*)>(.*?)</script\s*>',html,flags=re.I|re.S)
+              bodies=[body for attrs,body in scripts if not re.search(r'\bsrc\s*=',attrs,flags=re.I)
+                      and not re.search(r'\btype\s*=\s*["\']application/json["\']',attrs,flags=re.I)]
+              return ["'sha256-" + base64.b64encode(hashlib.sha256(b.encode('utf-8')).digest()).decode('ascii') + "'" for b in bodies]
+          hashes_portal=inline_hashes(portal_html)
+          hashes_v12=inline_hashes(v12_html)
+          if len(hashes_portal)!=2 or len(hashes_v12)!=2:
+              raise SystemExit('ERRO: quantidade de scripts inline mudou; revisar CSP')
+          portal_csp=(
+              "default-src 'none'; script-src 'self' " + ' '.join(hashes_portal) + "; "
+              "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+              "media-src 'self' blob:; font-src 'self' data:; connect-src 'none'; "
+              "frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+              "form-action 'none'; worker-src 'none'; upgrade-insecure-requests"
+          )
+          v12_csp=(
+              "default-src 'none'; script-src " + ' '.join(hashes_v12) + "; "
+              "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+              "connect-src 'none'; frame-src 'none'; object-src 'none'; "
+              "base-uri 'none'; frame-ancestors 'self'; form-action 'none'; "
+              "upgrade-insecure-requests"
+          )
+          root_headers = (output / '_headers')
+          original_rules = root_headers.read_text(encoding='utf-8').rstrip()
+          if not original_rules.startswith('/*') or 'Content-Security-Policy:' in original_rules:
+              raise SystemExit('ERRO: regras gerais de _headers alteradas; revisar antes de publicar.')
+          if 'X-Frame-Options: SAMEORIGIN' not in original_rules:
+              raise SystemExit('ERRO: V12 exige permitir iframe da mesma origem')
+          combined = (
+              original_rules + '\n  X-Robots-Tag: noindex, nofollow\n\n'
+              '/\n  Content-Security-Policy: ' + portal_csp + '\n\n'
+              '/abertura/*\n  Content-Security-Policy: ' + v12_csp + '\n'
+              '  X-Frame-Options: SAMEORIGIN\n\n'
+              '/jogo/*\n  Content-Security-Policy: ' + game_csp + '\n'
+              '  X-Frame-Options: DENY\n'
+          )
+          if max(map(len, combined.splitlines())) > 2000:
+              raise SystemExit('ERRO: linha muito longa no arquivo _headers (Cloudflare).')
+          root_headers.write_text(combined, encoding='utf-8')
+
+          # A configuracao aninhada nao sera interpretada como _headers pelo Pages.
+          # Remover SOMENTE da pasta de publicacao evita servir politica como asset.
+          game_headers.unlink()
+          (output / '.nojekyll').touch()
+          print(f'OK: {files} arquivos, {total_bytes/1_000_000:.1f} MB, {links} refs locais, '
+                f'{len(game_hashes)} arquivos do jogo integres, CSP por rota configurada.')
           PY
 
-      - name: Verificar sintaxe dos JavaScripts
+      - name: Verificar JavaScript do jogo
         shell: bash
         run: |
-          mapfile -d '' scripts < <(find dist/js -type f -name '*.js' -print0)
-          if [ "${#scripts[@]}" -eq 0 ]; then
-            echo '::error::Nenhum JavaScript encontrado em dist/js'
-            exit 1
-          fi
-          for script in "${scripts[@]}"; do
-            node --check "$script"
+          set -euo pipefail
+          n=0
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+            n=$((n+1))
+          done < <(find dist/jogo/js -type f -name '*.js' -print0)
+          test "$n" -gt 0
+          echo "OK: sintaxe valida em $n arquivos JavaScript."
+
+      - name: Verificar respostas HTTP locais (smoke test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8799 --directory dist >/tmp/portal-http.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:8799/; then break; fi
+            sleep 1
           done
-          echo "Sintaxe OK: ${#scripts[@]} arquivos JavaScript"
-
-      - name: Verificar e executar os tres testes obrigatorios
-        shell: bash
-        run: |
-          cd dist
-          testes=(
-            tests/scenery_npcs.test.js
-            tests/sidewalk_runners.test.js
-            tests/combat_stamina.test.cjs
-          )
-          for teste in "${testes[@]}"; do
-            if [ ! -f "$teste" ]; then
-              echo "::error::Teste obrigatorio ausente no site.zip: $teste"
-              echo 'Atualize o site.zip do GitHub com a versao Alpha 0.9.5 que contem tests/.'
-              exit 1
-            fi
-            echo "Teste encontrado: $teste"
+          for path in '/' '/abertura/' '/abertura/assets/lula.webp' '/jogo/' '/jogo/js/game.js' '/jogo/css/style.css'; do
+            curl --fail --silent --show-error --output /dev/null "http://127.0.0.1:8799$path"
+            echo "HTTP local OK: $path"
           done
-          # Um teste ausente ou reprovado interrompe a execucao.
-          node --test "${testes[@]}"
 
-      - name: Preparar somente os arquivos publicos
-        shell: bash
-        run: |
-          rm -rf dist/tests dist/docs dist/laboratorio
-          rm -f dist/*.md dist/VERSAO.txt dist/animacoes.html dist/teste_*.html
-          test -s dist/index.html
-          test -s dist/_headers
-          if find dist \( -name '.git' -o -name '.github' -o -name '.env' \) -print | grep -q .; then
-            echo '::error::Arquivos internos identificados na distribuicao'
-            exit 1
-          fi
-          echo "Arquivos publicos preparados: $(find dist -type f | wc -l)"
-
-      - name: Salvar pacote validado
-        uses: actions/upload-artifact@v6
+      - name: Salvar pacote de QA validado
+        uses: actions/upload-artifact@v4
         with:
-          name: site-validado
+          name: portal-cloudflare-qa-validado
           path: dist/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
 
   publicar_qa:
-    name: Publicar no Cloudflare QA
+    name: PUBLICAR portal no Cloudflare QA (com gates)
     needs: validar
-    if: ${{ inputs.operation == 'publicar-qa' && github.ref == 'refs/heads/main' }}
+    if: ${{ inputs.operacao == 'publicar-qa' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Configure Required reviewers no ambiente cloudflare-qa.
-    # QA e publico; publicar apenas com autorizacao para exposicao publica.
     environment: cloudflare-qa
-
+    permissions:
+      contents: read
     steps:
-      - name: Baixar exatamente o pacote validado
-        uses: actions/download-artifact@v7
+      - name: Exigir autorizacao e revisao juridica
+        shell: bash
+        env:
+          CONFIRMO_REVISAO: ${{ inputs.confirmo_revisao_juridica }}
+          AUTORIZO_QA: ${{ inputs.autorizo_publicacao_qa }}
+        run: |
+          if [ "$CONFIRMO_REVISAO" != 'true' ] || [ "$AUTORIZO_QA" != 'true' ]; then
+            echo '::error::Publicacao bloqueada. Concluir revisao juridica e autorizar exposicao publica do QA.'
+            exit 1
+          fi
+
+      - name: Usar exatamente o pacote previamente validado
+        uses: actions/download-artifact@v4
         with:
-          name: site-validado
+          name: portal-cloudflare-qa-validado
           path: dist
 
-      - name: Conferir arquivos antes de enviar
+      - name: Confirmar arquivos e headers antes do deploy
         shell: bash
         run: |
+          set -euo pipefail
           test -s dist/index.html
+          test -s dist/jogo/index.html
+          test -s dist/abertura/index.html
+          test -s dist/abertura/assets/lula.webp
+          test -s dist/jogo/js/game.js
           test -s dist/_headers
-          test -d dist/assets
-          test -d dist/js
+          grep -q '^/jogo/\*' dist/_headers
+          grep -q '^/abertura/\*' dist/_headers
+          grep -q 'X-Robots-Tag: noindex' dist/_headers
+          if find dist \( -name '.git' -o -name '.github' -o -name '.env' \) -print | grep -q .; then
+            echo '::error::Arquivos privados detectados na distribuicao.'
+            exit 1
+          fi
 
-      - name: Deploy Cloudflare Pages (nao Workers)
+      - name: Publicar no projeto EXISTENTE Cloudflare Pages QA
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
